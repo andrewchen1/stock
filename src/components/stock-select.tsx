@@ -2,7 +2,7 @@ import * as React from 'react'
 import { useState, useRef, useEffect } from 'react'
 import { TrendingUp, TrendingDown, Loader2 } from 'lucide-react'
 import type { Stock } from '@/model/stock'
-import { BaiDuStockApi } from '@/api/bai-du-stock-api'
+import { EastMoneyStockApi, goldSearchOptions } from '@/api/eastmoney-stock-api'
 import { Input } from '@/components/ui/input'
 import { ExchangeTag } from '@/components/exchange-tag'
 import { useStockColorStore } from '@/store/use-stock-color-store'
@@ -40,13 +40,14 @@ export function StockSelect({
 
     setLoading(true)
     try {
-      const res = await BaiDuStockApi.selfSelect(query)
-      const results: Stock[] = (res.ResultCode === '0' && res.Result?.stock) ? res.Result.stock : []
+      const emResults: Stock[] = await EastMoneyStockApi.selfSelect(query)
+      const results: Stock[] = [...emResults, ...goldSearchOptions(query)]
       setOptions(results)
       setShowDropdown(results.length > 0)
     }
     catch {
       setOptions([])
+      setShowDropdown(false)
     }
     finally {
       setLoading(false)

@@ -303,3 +303,21 @@ body.app-shell {
   opacity: 0;
   transition: all 0.5s ease-out;
 }
+
+/* 顶部跑马灯 */
+.ticker-track {
+  animation: ticker-marquee 45s linear infinite;
+}
+
+.ticker-strip:hover .ticker-track {
+  animation-play-state: paused;
+}
+
+@keyframes ticker-marquee {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}

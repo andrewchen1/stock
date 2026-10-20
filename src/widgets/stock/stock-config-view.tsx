@@ -6,6 +6,7 @@ import { useSelfSelectStockStore } from '@/store/use-self-select-stock-store'
 import { useStockColorStore } from '@/store/use-stock-color-store'
 import { EastMoneyStockApi } from '@/api/eastmoney-stock-api'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -57,10 +58,34 @@ export default function StockConfigView({ open = true, onOpenChange, onSave }: S
   const [refreshInterval, setRefreshInterval] = useState('60000')
   const [localStocks, setLocalStocks] = useState<Stock[]>([])
   const [listLoading, setListLoading] = useState(false)
+  const [clickThrough, setClickThrough] = useState(false)
+  const [proxyMode, setProxyMode] = useState<'auto' | 'direct' | 'custom'>('auto')
+  const [proxyRules, setProxyRules] = useState('')
 
   useEffect(() => {
     loadAll()
   }, [loadAll])
+
+  useEffect(() => {
+    window.stockShell?.getClickThrough?.().then(value => setClickThrough(!!value)).catch(() => {})
+    window.stockShell?.getProxy?.().then((proxy) => {
+      if (proxy) {
+        setProxyMode(proxy.mode === 'direct' || proxy.mode === 'custom' ? proxy.mode : 'auto')
+        setProxyRules(proxy.rules ?? '')
+      }
+    }).catch(() => {})
+  }, [])
+
+  const toggleClickThrough = useCallback((checked: boolean) => {
+    setClickThrough(checked)
+    window.stockShell?.setClickThrough?.(checked)?.catch(() => {})
+  }, [])
+
+  const changeProxy = useCallback((mode: 'auto' | 'direct' | 'custom', rules: string) => {
+    setProxyMode(mode)
+    setProxyRules(rules)
+    window.stockShell?.setProxy?.({ mode, rules })?.catch(() => {})
+  }, [])
 
   const refreshAllStocks = useCallback(async (stockList: Stock[]) => {
     if (stockList.length === 0) return
@@ -75,6 +100,8 @@ export default function StockConfigView({ open = true, onOpenChange, onSave }: S
           return {
             ...original,
             ...result.value,
+            // 回退数据源（如腾讯）返回的是英文名，保留用户添加时看到的名称
+            name: original.name || result.value.name,
             sortOrder: original.sortOrder,
             holdingPrice: original.holdingPrice,
             holdingShares: original.holdingShares,
@@ -319,6 +346,54 @@ export default function StockConfigView({ open = true, onOpenChange, onSave }: S
                     <ArrowDown className="h-3 w-3" style={{ color: '#ef4444' }} />
                     <span className="font-medium" style={{ color: '#ef4444' }}>红</span>
                   </button>
+                </div>
+              </div>
+
+              <div className="col-span-2 grid grid-cols-[88px_minmax(0,1fr)] items-center gap-3">
+                <Label htmlFor="click-through" className="whitespace-nowrap">点击穿透</Label>
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="click-through"
+                    checked={clickThrough}
+                    onCheckedChange={value => toggleClickThrough(value === true)}
+                  />
+                  <Label
+                    htmlFor="click-through"
+                    className="text-xs text-muted-foreground font-normal cursor-pointer"
+                  >
+                    开启后鼠标点击会穿过组件、操作下层窗口；可在此处或托盘菜单关闭
+                  </Label>
+                </div>
+              </div>
+
+              <div className="col-span-2 grid grid-cols-[88px_minmax(0,1fr)] items-center gap-3">
+                <Label className="whitespace-nowrap">网络代理</Label>
+                <div className="flex items-center gap-2 min-w-0">
+                  <Select
+                    value={proxyMode}
+                    onValueChange={value => changeProxy(value as 'auto' | 'direct' | 'custom', proxyRules)}
+                  >
+                    <SelectTrigger className="w-[150px] shrink-0">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="auto">自动探测 (clash)</SelectItem>
+                      <SelectItem value="direct">直连</SelectItem>
+                      <SelectItem value="custom">自定义</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  {proxyMode === 'custom' && (
+                    <Input
+                      value={proxyRules}
+                      placeholder="例如 127.0.0.1:7890"
+                      className="h-8 flex-1 min-w-0 text-sm"
+                      onChange={e => setProxyRules(e.target.value)}
+                      onBlur={() => changeProxy('custom', proxyRules)}
+                    />
+                  )}
+                  {proxyMode === 'auto' && (
+                    <span className="text-xs text-muted-foreground">自动使用本机 fclash/clash 代理端口</span>
+                  )}
                 </div>
               </div>
             </div>

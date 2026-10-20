@@ -48,17 +48,24 @@ export const useStockColorStore = create<StockColorState>(
         return get().stockColor === 0 ? GREEN : RED
       },
 
-      getColorByValue: (value: number | boolean) => {
-        const state = get()
-        const isUp = typeof value === 'number' ? value >= 0 : value
-        const color = isUp
-          ? (state.stockColor === 0 ? RED : GREEN)
-          : (state.stockColor === 0 ? GREEN : RED)
-        return {
-          color,
-          colorEnd: Color(color).alpha(0).string(),
-        }
-      },
+  getColorByValue: (value: number | boolean) => {
+    const state = get()
+    // 平盘（0）用中性灰，避免红色 0.00% 看起来像数据出错
+    if (typeof value === 'number' && value === 0) {
+      return {
+        color: '#9ca3af',
+        colorEnd: Color('#9ca3af').alpha(0).string(),
+      }
+    }
+    const isUp = typeof value === 'number' ? value > 0 : value
+    const color = isUp
+      ? (state.stockColor === 0 ? RED : GREEN)
+      : (state.stockColor === 0 ? GREEN : RED)
+    return {
+      color,
+      colorEnd: Color(color).alpha(0).string(),
+    }
+  },
     }),
     {
       name: 'stock_color',

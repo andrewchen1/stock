@@ -1,6 +1,6 @@
-import { useMemo } from 'react'
 import styled from 'styled-components'
 import { ExchangeTag } from '@/components/exchange-tag'
+import { StockChart } from '@/components/stock-chart'
 import { cn, formatMoney, formatNumber, formatPercent } from '@/lib/utils'
 import type { Stock } from '@/model/stock'
 
@@ -18,113 +18,21 @@ const RatioBadge = styled.span<{ $backgroundColor: string }>`
   font-variant-numeric: tabular-nums;
 `
 
-interface MiniSparklineProps {
-  ratio: number
-  color: string
-  seed: string
-}
-
-function MiniSparkline({ ratio, color, seed }: MiniSparklineProps) {
-  const isUp = ratio >= 0
-
-  const points = useMemo(() => {
-    let h = 0
-    for (let i = 0; i < seed.length; i++) {
-      h = Math.imul(31, h) + seed.charCodeAt(i) | 0
-    }
-    const rng = () => {
-      h = Math.imul(h ^ h >>> 16, 0x85ebca6b) | 0
-      h = Math.imul(h ^ h >>> 13, 0xc2b2ae35) | 0
-      const r = (h ^= h >>> 16) >>> 0
-      return r / 4294967296
-    }
-    const n = 24
-    const startValue = 0.5
-    let v0 = Math.abs(ratio) / 5 + 0.02
-    const pts: number[] = []
-    let cur = startValue
-    for (let i = 0; i < n; i++) {
-      const t = i / (n - 1)
-      const trend = isUp ? -v0 + 2 * v0 * t + v0 * Math.sin(t * Math.PI * 1.2) : v0 - 2 * v0 * t
-      cur = startValue + trend + (rng() - 0.5) * 0.12
-      pts.push(Math.max(0.05, Math.min(0.95, cur)))
-    }
-    return pts
-  }, [ratio, isUp, seed])
-
-  const W = 60
-  const H = 32
-  const padX = 4
-  const padY = 4
-  const graphW = W - padX * 2
-  const graphH = H - padY * 2
-
-  const { pathD, areaD, startY } = useMemo(() => {
-    const max = Math.max(...points)
-    const min = Math.min(...points)
-    const range = max - min || 1
-    const startVal = 0.5
-    const pathArr = points.map((v, i) => {
-      const x = padX + (i / (points.length - 1)) * graphW
-      const y = padY + graphH * (1 - (v - min) / range)
-      return { x, y }
-    })
-    const sy = padY + graphH * (1 - (startVal - min) / range)
-    const d = pathArr.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(' ')
-    const a = `${d} L${(padX + graphW).toFixed(2)},${(padY + graphH).toFixed(2)} L${padX.toFixed(2)},${(padY + graphH).toFixed(2)} Z`
-    return { pathD: d, areaD: a, startY: sy }
-  }, [points, graphW, graphH, padX, padY])
-
-  const gradId = useMemo(() => `spark-${Math.random().toString(36).slice(2, 9)}`, [])
-
-  return (
-    <svg
-      width={W}
-      height={H}
-      viewBox={`0 0 ${W} ${H}`}
-      style={{ flexShrink: 0 }}
-      preserveAspectRatio="none"
-    >
-      <defs>
-        <linearGradient id={gradId} x1="0" x2="0" y1="0" y2="1">
-          <stop offset="0%" stopColor={color} stopOpacity="0.35" />
-          <stop offset="100%" stopColor={color} stopOpacity="0" />
-        </linearGradient>
-      </defs>
-      <line
-        x1={padX}
-        x2={padX + graphW}
-        y1={startY}
-        y2={startY}
-        stroke={color}
-        strokeOpacity="0.55"
-        strokeWidth="1.2"
-        strokeDasharray="3 3"
-      />
-      <path d={areaD} fill={`url(#${gradId})`} />
-      <path
-        d={pathD}
-        fill="none"
-        stroke={color}
-        strokeWidth="1.8"
-        strokeLinejoin="round"
-        strokeLinecap="round"
-      />
-    </svg>
-  )
-}
-
 interface StockItemProps {
   stock: Stock
   idx: number
   isLast: boolean
   metricMode: StockMetricMode
   getColorByValue: (value: number) => { color: string }
+  /** A+H：同名 H 股招股信息（发售价为港元） */
+  hkIpo?: { code: string, name: string, offerPrice: number, listingDate: string }
+  /** 港元兑人民币实时汇率 */
+  fxRate?: number
 }
 
 export type StockMetricMode = 'changePercent' | 'returnRate' | 'returnAmount'
 
-export default function StockItem({ stock, idx, isLast, metricMode, getColorByValue }: StockItemProps) {
+export default function StockItem({ stock, idx, isLast, metricMode, getColorByValue, hkIpo, fxRate }: StockItemProps) {
   const ratio = Number.parseFloat(stock.ratio) || 0
   const increase = Number.parseFloat(stock.increase) || 0
   const price = Number.parseFloat(stock.price) || 0
@@ -147,6 +55,35 @@ export default function StockItem({ stock, idx, isLast, metricMode, getColorByVa
   const { color: marketColor } = getColorByValue(ratio)
   const { color: metricColor } = getColorByValue(metricValue)
 
+  // A+H：同名 H 股招股的发售价（港元）折算人民币并计算相对 A 股现价的折价
+  const hkOffer = hkIpo?.offerPrice
+  const hkOfferCny = hkOffer && fxRate ? hkOffer * fxRate : undefined
+  const hkDiscount = hkOfferCny !== undefined && price > 0 ? (1 - hkOfferCny / price) * 100 : undefined
+
+  // IPO 扫描自动加入的行（上市首日）：以琥珀横幅形式展示首日表现
+  // 未上市前（发售价未公布等）显示 发行价 / 待上市
+  const isPreListing = !!stock.autoAdded && !(price > 0)
+  const offerPriceNum = Number.parseFloat(stock.high ?? '')
+
+  // 自动加入的首日行：琥珀横幅形式（与“招股中”提示行同款样式）
+  if (stock.autoAdded) {
+    return (
+      <div
+        className="mb-1 flex items-center justify-between overflow-hidden rounded-lg border border-amber-300/20 bg-amber-400/10 px-3 py-1.5 text-[11px]"
+        title="今日上市新股首日表现（收盘后自动移出面板）"
+      >
+        <span className="truncate text-amber-100/90">
+          <span className="mr-1">🚀</span>今日上市 {stock.name} {stock.code}
+        </span>
+        <span className="ml-2 shrink-0 font-semibold tabular-nums" style={{ color: price > 0 ? getColorByValue(ratio).color : 'var(--widget-color, inherit)' }}>
+          {price > 0
+            ? `${price.toFixed(2)} ${ratio >= 0 ? '+' : ''}${ratio.toFixed(2)}%`
+            : (Number.isFinite(offerPriceNum) ? `发行价 ${offerPriceNum}` : '待上市')}
+        </span>
+      </div>
+    )
+  }
+
   return (
     <div
       key={stock.code}
@@ -160,12 +97,21 @@ export default function StockItem({ stock, idx, isLast, metricMode, getColorByVa
           {stock.name}
         </span>
         <div className="flex items-center gap-1.5 mt-1">
-          <ExchangeTag
-            exchange={stock.market || 'us'}
-            size="xs"
-            style={{ height: '10px', width: 'auto' }}
-            className="!w-auto"
-          />
+          {stock.market === 'gold' ? (
+            <span
+              className="text-[9px] font-bold leading-none px-1 py-[2px] rounded border border-amber-300/50 bg-amber-400/35 text-amber-200 shrink-0"
+              title="上海黄金交易所"
+            >
+              SGE
+            </span>
+          ) : (
+            <ExchangeTag
+              exchange={stock.market || 'us'}
+              size="xs"
+              style={{ height: '10px', width: 'auto' }}
+              className="!w-auto"
+            />
+          )}
           <span className="text-[12px] leading-none tracking-wide" style={{ color: 'var(--widget-color, inherit)' }}>
             {stock.code}
           </span>
@@ -173,25 +119,51 @@ export default function StockItem({ stock, idx, isLast, metricMode, getColorByVa
       </div>
 
       <div className="flex justify-center">
-        <MiniSparkline ratio={ratio} color={marketColor} seed={stock.code} />
+        {!isPreListing && <StockChart code={stock.code} height={32} />}
       </div>
 
-      <div className="flex min-w-0 flex-col items-end justify-center gap-1.5">
-        <span className="text-[12px] font-semibold tabular-nums leading-none" style={{ color: 'var(--widget-color, inherit)' }}>
-          {formatNumber(stock.price, 3)}
-        </span>
-        <span
-          className="text-[12px] font-semibold tabular-nums leading-none"
-          style={{ color: marketColor }}
-        >
-          {increase >= 0 ? '+' : ''}
-          {formatNumber(String(increase), 2)}
-        </span>
+      <div className="flex min-w-0 flex-col items-end justify-center gap-1">
+        {isPreListing ? (
+          <span className="text-[12px] font-semibold tabular-nums leading-none" style={{ color: 'var(--widget-color, inherit)' }}>
+            {Number.isFinite(offerPriceNum) ? `发行价 ${offerPriceNum}` : '待上市'}
+          </span>
+        ) : (
+          <span className="text-[12px] font-semibold tabular-nums leading-none" style={{ color: 'var(--widget-color, inherit)' }}>
+            {formatNumber(stock.price, 3)}
+          </span>
+        )}
+        {!isPreListing && (
+          <span
+            className="text-[12px] font-semibold tabular-nums leading-none"
+            style={{ color: marketColor }}
+          >
+            {increase >= 0 ? '+' : ''}
+            {formatNumber(String(increase), 2)}
+          </span>
+        )}
+        {!isPreListing && (
+          <span
+            className="text-[10px] font-normal tabular-nums leading-none whitespace-nowrap truncate max-w-full opacity-60"
+            style={{ color: 'var(--widget-color, inherit)' }}
+            title={`盘中最高 ${stock.high ?? '--'} / 盘中最低 ${stock.low ?? '--'}`}
+          >
+            高 {stock.high ?? '--'}  低 {stock.low ?? '--'}
+          </span>
+        )}
+        {hkIpo && (
+          <span
+            className="text-[10px] font-semibold leading-none whitespace-nowrap truncate max-w-full"
+            style={{ color: '#f5c451' }}
+            title={`A+H：H股发售价 HK$${hkIpo.offerPrice.toFixed(2)} ≈¥${(hkOfferCny ?? 0).toFixed(2)}，相对现价折价 ${Math.abs(hkDiscount ?? 0).toFixed(1)}%${hkIpo.listingDate ? `（${hkIpo.listingDate} 上市）` : ''}`}
+          >
+            {`H发 ${hkOfferCny !== undefined ? `¥${hkOfferCny.toFixed(2)}` : `HK$${(hkOffer ?? 0).toFixed(2)}`} · 折价${Math.abs(hkDiscount ?? 0).toFixed(0)}%`}
+          </span>
+        )}
       </div>
 
       <div className="flex justify-end">
-        <RatioBadge $backgroundColor={metricColor} title={metricText}>
-          {metricText}
+        <RatioBadge $backgroundColor={isPreListing ? 'rgba(156,163,175,0.35)' : metricColor} title={isPreListing ? '待上市' : metricText}>
+          {isPreListing ? '待上市' : metricText}
         </RatioBadge>
       </div>
     </div>

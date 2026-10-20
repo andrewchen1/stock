@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { CachePolicy, withDbCache } from '@/api/http-cache'
 
 const EAST_MONEY_QUOTE_URL = 'https://push2.eastmoney.com/api/qt/stock/get'
 const EAST_MONEY_TRENDS_URL = 'https://push2his.eastmoney.com/api/qt/stock/trends2/get'
@@ -16,6 +17,15 @@ const INSTRUMENT_CODES: Record<string, string> = {
   Au100g: 'AU100G',
   'Au(T+D)': 'AUTD',
   'mAu(T+D)': 'MAUTD',
+}
+
+// 新浪上金所行情代码（SGE_*）
+const SINA_INSTRUMENT_CODES: Record<string, string> = {
+  'Au99.99': 'SGE_AU9999',
+  'Au99.95': 'SGE_AU9995',
+  Au100g: 'SGE_AU100G',
+  'Au(T+D)': 'SGE_AUTD',
+  'mAu(T+D)': 'SGE_MAUTD',
 }
 
 interface EastMoneyQuote {
@@ -75,6 +85,52 @@ export class GoldApi {
   }
 
   private static async fetchQuotations(instrumentId: string): Promise<GoldApiResponse> {
+    try {
+      return await withDbCache(`gold:em:${instrumentId}`, () => this.fetchQuotationsFromEastMoney(instrumentId), CachePolicy.gold)
+    }
+    catch (error) {
+      // 东方财富接口不可用时，回退到新浪的上金所行情
+      const fallback = await withDbCache(`gold:sina:${instrumentId}`, () => this.fetchQuotationsFromSina(instrumentId), CachePolicy.gold)
+      if (fallback) return fallback
+      throw error
+    }
+  }
+
+  private static async fetchQuotationsFromSina(instrumentId: string): Promise<GoldApiResponse | undefined> {
+    const sinaCode = SINA_INSTRUMENT_CODES[instrumentId]
+    if (!sinaCode) return undefined
+    try {
+      const response = await axios.get(`https://hq.sinajs.cn/list=${sinaCode}`, {
+        responseType: 'arraybuffer',
+        headers: { Referer: 'https://finance.sina.com.cn' },
+        timeout: 10000,
+      })
+      const text = new TextDecoder('gbk').decode(response.data)
+      const m = text.match(/="(.*)"/)
+      if (!m) return undefined
+      const f = m[1].split(',')
+      const latestPrice = Number.parseFloat(f[3])
+      const yesterdayClose = Number.parseFloat(f[5])
+      const max = Number.parseFloat(f[6])
+      const min = Number.parseFloat(f[8])
+      if (!Number.isFinite(latestPrice) || latestPrice <= 0) return undefined
+      return {
+        times: [],
+        data: [],
+        min: Number.isFinite(min) ? min : latestPrice,
+        max: Number.isFinite(max) ? max : latestPrice,
+        heyue: instrumentId,
+        delaystr: String(f[16] ?? ''),
+        latestPrice,
+        yesterdayClose: Number.isFinite(yesterdayClose) && yesterdayClose > 0 ? yesterdayClose : latestPrice,
+      }
+    }
+    catch {
+      return undefined
+    }
+  }
+
+  private static async fetchQuotationsFromEastMoney(instrumentId: string): Promise<GoldApiResponse> {
     const secid = getSecurityId(instrumentId)
     const quoteResponse = await axios.get<EastMoneyResponse<EastMoneyQuote>>(
       EAST_MONEY_QUOTE_URL,

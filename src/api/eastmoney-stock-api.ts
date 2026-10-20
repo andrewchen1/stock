@@ -1,6 +1,8 @@
 import type { OpenDataResult } from '@/api/opendata'
 import type { Stock } from '@/model/stock'
 import { Quotation } from '@/model/quotation'
+import { GoldApi } from '@/api/gold-api'
+import { CachePolicy, dbCacheGet, dbCacheSet, emitStatus, FALLBACK_GRACE_MS, withDbCache } from '@/api/http-cache'
 import axios, { type AxiosRequestConfig } from 'axios'
 
 const CACHE_TTL_MS = 60_000
@@ -14,6 +16,16 @@ function cacheKey(url: string, params?: Record<string, any>): string {
   return `${url}?${sorted.join('&')}`
 }
 
+function cachePolicyForUrl(url: string): { freshMs: number, staleMs: number } {
+  if (url.includes('trends2/get')) {
+    return CachePolicy.minute
+  }
+  if (url.includes('/sug?') || url.includes('suggest/get')) {
+    return { freshMs: 5 * 60_000, staleMs: 1 * 24 * 3600 * 1000 }
+  }
+  return CachePolicy.quote
+}
+
 async function cachedGet<T = any>(url: string, config?: AxiosRequestConfig): Promise<T> {
   const key = cacheKey(url, config?.params as Record<string, any> | undefined)
   const hit = cache.get(key)
@@ -21,9 +33,25 @@ async function cachedGet<T = any>(url: string, config?: AxiosRequestConfig): Pro
   if (hit && hit.expireAt > now) {
     return hit.value as T
   }
-  const response = await axios.get(url, config)
-  cache.set(key, { expireAt: now + CACHE_TTL_MS, value: response.data })
-  return response.data as T
+  const policy = cachePolicyForUrl(url)
+  try {
+    const response = await axios.get(url, config)
+    cache.set(key, { expireAt: now + CACHE_TTL_MS, value: response.data })
+    dbCacheSet(key, response.data)
+    emitStatus({ type: 'ok' })
+    return response.data as T
+  }
+  catch (error) {
+    // 网络失败（限流/断网/代理不可用）时，返回有效期内的 SQLite 旧数据兜底
+    const dbHit = await dbCacheGet(key, policy.staleMs)
+    if (dbHit) {
+      if (dbHit.age > FALLBACK_GRACE_MS) {
+        emitStatus({ type: 'stale', key, ageMs: dbHit.age })
+      }
+      return JSON.parse(dbHit.payload) as T
+    }
+    throw error
+  }
 }
 
 function baiduExchangeToEmSecid(code: string, exchange?: string): string {
@@ -59,6 +87,8 @@ function emMarketToBaiduExchange(mk: number, type?: string, code?: string): stri
     if (u === '.DJI' || u === '.IXIC' || u === '.INX') return 'US'
     return 'NASDAQ'
   }
+  // 153 = 美股粉单市场（OTC，如滴滴 ADR DIDIY）
+  if (mk === 153) return 'US'
   return 'SH'
 }
 
@@ -78,6 +108,126 @@ function sign(x: number): '1' | '-1' | '0' {
   if (x > 0) return '1'
   if (x < 0) return '-1'
   return '0'
+}
+
+// 上海黄金交易所合约：以 GOLD: 为前缀并入股票自选列表，报价走 GoldApi（EM 上金所 + 新浪回退）
+export const GOLD_INSTRUMENTS: Record<string, string> = {
+  'GOLD:Au99.99': '黄金 Au99.99',
+  'GOLD:mAu(T+D)': '黄金 mAu(T+D)',
+  'GOLD:Au(T+D)': '黄金 Au(T+D)',
+}
+
+export function isGoldCode(code: string): boolean {
+  return code.startsWith('GOLD:')
+}
+
+export function goldSearchOptions(query: string): Stock[] {
+  const q = query.trim()
+  if (!q) return []
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '')
+  const nq = norm(q)
+  return Object.entries(GOLD_INSTRUMENTS)
+    .filter(([code, name]) => {
+      if (q.includes('黄金') || name.includes(q)) return true
+      return nq.length > 0 && (norm(code).includes(nq) || norm(name).includes(nq))
+    })
+    .map(([code, name]) => ({
+      code,
+      type: 'stock' as const,
+      market: 'gold',
+      follow_status: '0',
+      amount: '0',
+      exchange: 'SGE',
+      name,
+      price: '--',
+      increase: '0',
+      ratio: '0',
+      amplitudeRatio: '0',
+      turnoverRatio: '0',
+      holdingAmount: '0',
+      volume: '0',
+      capitalization: '0',
+      peRate: '0',
+      pbRate: '0',
+      status: '0',
+      stockStatus: '6',
+      stockStatusInfo: 'STOPT' as const,
+      src_loc: '',
+      subType: '',
+      sf_url: '',
+      pv: '0',
+      CNYPrice: '--',
+    }))
+}
+
+// 东方财富 push2 接口偶尔限流/不可达，用腾讯行情做回退，保证价格能刷出来
+function tencentPrefixFor(code: string): string | null {
+  if (/^\d{6}$/.test(code)) {
+    return /^[569]/.test(code) ? 'sh' : 'sz'
+  }
+  if (/^\d{5}$/.test(code)) {
+    return 'hk'
+  }
+  // 美股/粉单（字母代码，如 AAPL、DIDIY）
+  if (/^[A-Za-z]/.test(code)) {
+    return 'us'
+  }
+  return null
+}
+
+async function getTencentQuoteStock(code: string, type?: StockType): Promise<Stock | undefined> {
+  const prefix = tencentPrefixFor(code)
+  if (!prefix) return undefined
+  try {
+    const response = await axios.get(`https://qt.gtimg.cn/q=${prefix}${code}`, { responseType: 'arraybuffer' })
+    const text = new TextDecoder('gbk').decode(response.data)
+    const m = text.match(/="(.*)"/)
+    if (!m) return undefined
+    const f = m[1].split('~')
+    const price = Number.parseFloat(f[3])
+    if (!Number.isFinite(price) || price <= 0) return undefined
+    const prevClose = Number.parseFloat(f[4])
+    const high = Number.parseFloat(f[33])
+    const low = Number.parseFloat(f[34])
+    const increase = Number.isFinite(Number.parseFloat(f[31])) ? Number.parseFloat(f[31]) : price - (Number.isFinite(prevClose) ? prevClose : price)
+    const ratioPct = Number.isFinite(Number.parseFloat(f[32])) ? Number.parseFloat(f[32]) : (Number.isFinite(prevClose) && prevClose > 0 ? (increase / prevClose) * 100 : 0)
+    const amplitude = Number.isFinite(high) && Number.isFinite(low) && Number.isFinite(prevClose) && prevClose > 0
+      ? ((high - low) / prevClose) * 100
+      : 0
+    const ex = prefix.toUpperCase()
+    return {
+      code,
+      type: type ?? 'stock',
+      market: ex === 'HK' ? 'hk' : (ex === 'US' ? 'us' : 'cn'),
+      follow_status: '0',
+      amount: f[37] ?? '0',
+      exchange: ex,
+      name: f[1] ?? code,
+      price: price.toFixed(2),
+      high: Number.isFinite(high) ? high.toFixed(2) : price.toFixed(2),
+      low: Number.isFinite(low) ? low.toFixed(2) : price.toFixed(2),
+      increase: increase.toFixed(2),
+      ratio: `${ratioPct.toFixed(2)}%`,
+      amplitudeRatio: amplitude.toFixed(2),
+      turnoverRatio: f[38] ?? '0',
+      holdingAmount: '0',
+      volume: f[36] ?? '0',
+      capitalization: '0',
+      peRate: f[39] ?? '0',
+      pbRate: '0',
+      status: sign(increase),
+      stockStatus: '6',
+      stockStatusInfo: 'ENDTR',
+      src_loc: '',
+      subType: '',
+      sf_url: '',
+      pv: '0',
+      CNYPrice: price.toFixed(2),
+    }
+  }
+  catch {
+    return undefined
+  }
 }
 
 interface EmQuoteKlt1Item {
@@ -119,6 +269,8 @@ function emQuoteToStock(q: EmQuoteKlt1Item, mk: number): Stock {
     exchange: emMarketToBaiduExchange(mk, 'stock', q.f57),
     name: q.f58,
     price: price.toFixed(q.f52),
+    high: q.f44 ? (q.f44 / Math.pow(10, q.f52 - 0)).toFixed(q.f52) : price.toFixed(q.f52),
+    low: q.f45 ? (q.f45 / Math.pow(10, q.f52 - 0)).toFixed(q.f52) : price.toFixed(q.f52),
     increase: increase.toFixed(q.f52),
     ratio: `${ratio.toFixed(2)}%`,
     amplitudeRatio: q.f170 ? String(q.f170 / 100) : '0',
@@ -148,21 +300,87 @@ export class EastMoneyStockApi {
     return this.getByType(code, 'fund')
   }
 
+  private static async getGoldStock(code: string, type?: StockType): Promise<Stock | undefined> {
+    const instrumentId = code.slice(5)
+    try {
+      const g = await GoldApi.quotations(instrumentId)
+      const change = g.latestPrice - g.yesterdayClose
+      const ratioPct = g.yesterdayClose > 0 ? (change / g.yesterdayClose) * 100 : 0
+      const stock: Stock = {
+        code,
+        type: type ?? 'stock',
+        market: 'gold',
+        follow_status: '0',
+        amount: '0',
+        exchange: 'SGE',
+        name: GOLD_INSTRUMENTS[code] ?? `黄金 ${instrumentId}`,
+        price: g.latestPrice.toFixed(2),
+        high: g.max > 0 ? g.max.toFixed(2) : g.latestPrice.toFixed(2),
+        low: g.min > 0 ? g.min.toFixed(2) : g.latestPrice.toFixed(2),
+        increase: change.toFixed(2),
+        ratio: `${ratioPct.toFixed(2)}%`,
+        amplitudeRatio:
+          g.yesterdayClose > 0 && g.max > 0 && g.min > 0
+            ? (((g.max - g.min) / g.yesterdayClose) * 100).toFixed(2)
+            : '0',
+        turnoverRatio: '0',
+        holdingAmount: '0',
+        volume: '0',
+        capitalization: '0',
+        peRate: '0',
+        pbRate: '0',
+        status: sign(change),
+        stockStatus: '6',
+        stockStatusInfo: 'ENDTR',
+        src_loc: '',
+        subType: '',
+        sf_url: '',
+        pv: '0',
+        CNYPrice: g.latestPrice.toFixed(2),
+      }
+      if (type && stock.type !== type) return undefined
+      return stock
+    }
+    catch {
+      return undefined
+    }
+  }
+
   static async getByType<T>(code: string, type?: StockType): Promise<T | undefined> {
+    if (isGoldCode(code)) {
+      return (await this.getGoldStock(code, type)) as unknown as T
+    }
     const secid = baiduExchangeToEmSecid(code)
     try {
       const data = await cachedGet<string>(
         `https://push2.eastmoney.com/api/qt/stock/get?secid=${secid}&fields=f43,f44,f45,f46,f47,f48,f50,f51,f52,f57,f58,f60,f116,f117,f162,f167,f168,f169,f170,f171,f177,f178&ut=fa5fd1943c7b386f172d6893dbfba10b&invt=2&fltt=2`
       )
-      const parsed = data as unknown as { data: EmQuoteKlt1Item | null }
-      if (!parsed?.data) return undefined
+      let parsed = data as unknown as { data: EmQuoteKlt1Item | null }
+      // 美股粉单市场（OTC）的 secid 是 153.，默认的 105. 查不到时补查一次
+      if (!parsed?.data && secid.startsWith('105.')) {
+        const otcData = await cachedGet<string>(
+          `https://push2.eastmoney.com/api/qt/stock/get?secid=153.${code}&fields=f43,f44,f45,f46,f47,f48,f50,f51,f52,f57,f58,f60,f116,f117,f162,f167,f168,f169,f170,f171,f177,f178&ut=fa5fd1943c7b386f172d6893dbfba10b&invt=2&fltt=2`
+        )
+        parsed = otcData as unknown as { data: EmQuoteKlt1Item | null }
+        if (parsed?.data) {
+          const stock = emQuoteToStock(parsed.data, 153)
+          if (type && stock.type !== type) return undefined
+          stock.code = code
+          return stock as unknown as T
+        }
+      }
+      // 未上市代码（如招股中的新股）EM 返回占位数据（价格 0），视为无行情，保留发售价
+      if (!parsed?.data || !Number.isFinite(Number(parsed.data.f43)) || Number(parsed.data.f43) <= 0) {
+        return (await getTencentQuoteStock(code, type)) as unknown as T
+      }
       const mk = Number.parseInt(secid.split('.')[0], 10)
       const stock = emQuoteToStock(parsed.data, mk)
       if (type && stock.type !== type) return undefined
       stock.code = code
       return stock as unknown as T
-    } catch {
-      return undefined
+    }
+    catch {
+      return (await getTencentQuoteStock(code, type)) as unknown as T
     }
   }
 
@@ -215,7 +433,7 @@ export class EastMoneyStockApi {
           follow_status: '0',
           amount: '0',
           exchange: emMarketToBaiduExchange(mk, type === 'index' ? 'index' : 'stock', item.Code),
-          name: item.SecurityTypeName,
+          name: item.Name || item.SecurityTypeName,
           price: '--',
           increase: '0',
           ratio: '0',
@@ -329,6 +547,182 @@ export class EastMoneyStockApi {
 
   static async getQuotationMinute(code: string, group: QuotationGroup = 'quotation_minute_ab'): Promise<Quotation> {
     void group
+    if (isGoldCode(code)) {
+      return this.getGoldQuotationMinute(code)
+    }
+    const em = await this.getEmQuotationMinute(code)
+    if (em.newMarketData?.marketData?.length) {
+      return em
+    }
+    // 美股/OTC（字母代码）：Yahoo 有公开分钟线（粉单 ADR 腾讯/东财都没有分时）
+    if (/^[A-Za-z]/.test(code)) {
+      const yahoo = await withDbCache(`yahoo-min:${code}`, () => this.getYahooQuotationMinute(code), CachePolicy.minute)
+      if (yahoo) return yahoo
+    }
+    return (await withDbCache(`tx-min:${code}`, () => this.getTencentQuotationMinute(code), CachePolicy.minute)) ?? em
+  }
+
+  private static async getYahooQuotationMinute(code: string): Promise<Quotation | undefined> {
+    try {
+      const response = await axios.get(
+        `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(code)}?range=1d&interval=5m&includePrePost=false`,
+        { responseType: 'arraybuffer', timeout: 20000 },
+      )
+      const json = JSON.parse(new TextDecoder('utf-8').decode(response.data))
+      const result = json?.chart?.result?.[0]
+      const timestamps: number[] = result?.timestamp ?? []
+      const closes: (number | null)[] = result?.indicators?.quote?.[0]?.close ?? []
+      if (timestamps.length === 0) return undefined
+      const timezone: string = result?.meta?.exchangeTimezoneName ?? 'America/New_York'
+      const parsedPrevClose = Number(result?.meta?.chartPreviousClose ?? result?.meta?.previousClose)
+      const marketData: { date: string, p: string }[] = []
+      let lastPrice = 0
+      for (let i = 0; i < timestamps.length; i++) {
+        const price = closes[i]
+        if (price == null || !Number.isFinite(price)) continue
+        lastPrice = price
+        const time = new Date(timestamps[i] * 1000).toLocaleTimeString('zh-CN', {
+          timeZone: timezone,
+          hour12: false,
+          hour: '2-digit',
+          minute: '2-digit',
+        })
+        marketData.push({ date: time, p: `${time},${price},,0,0` })
+      }
+      if (marketData.length === 0 || lastPrice <= 0) return undefined
+      const prevClose = Number.isFinite(parsedPrevClose) && parsedPrevClose > 0 ? parsedPrevClose : lastPrice
+      const change = lastPrice - prevClose
+      const ratioPct = (change / prevClose) * 100
+      return new Quotation({
+        pankouinfos: {
+          indicatorTitle: '盘口',
+          indicatorUrl: '',
+          list: [
+            { ename: 'preClose', name: '昨收', value: prevClose.toFixed(2), originValue: String(prevClose) },
+          ],
+        },
+        askinfos: [],
+        buyinfos: [],
+        update: {
+          text: '',
+          time: String(Math.floor(Date.now() / 1000)),
+          realUpdateTime: '',
+          timezone,
+          shortZone: '',
+          time_diff: 0,
+          stockStatus: '',
+          tradeStatus: 'ENDTR',
+          tradeStatusCN: '',
+        },
+        cur: {
+          time: Math.floor(Date.now() / 1000),
+          price: lastPrice.toFixed(2),
+          ratio: `${ratioPct.toFixed(2)}%`,
+          increase: change.toFixed(2),
+          volume: '0',
+          avgPrice: '--',
+          timeKey: '',
+          amount: '--',
+          show: 1,
+          unit: '',
+        },
+        basicinfos: {
+          exchange: 'US',
+          code,
+          name: String(result?.meta?.shortName ?? result?.meta?.longName ?? code),
+          stockStatus: '',
+          stock_market_code: '105',
+          stockCode: code,
+          tradeStatus: 'ENDTR',
+          tradeStatusCN: '',
+        },
+        tag_list: [],
+        chartTabs: [],
+        tradingCounters: [],
+        foreign_key: code,
+        releaseDate: '',
+        useWS: '0',
+        financeType: 'stock',
+        newMarketData: {
+          headers: ['时间', '价格', '均价', '成交量', '成交额'],
+          keys: ['date', 'p'],
+          marketData,
+        },
+      })
+    }
+    catch {
+      return undefined
+    }
+  }
+
+  private static async getGoldQuotationMinute(code: string): Promise<Quotation> {
+    const instrumentId = code.slice(5)
+    const g = await GoldApi.quotations(instrumentId)
+    const marketData = g.times.map((t, i) => ({
+      date: t,
+      p: `${t},${g.data[i] ?? g.latestPrice.toFixed(2)},,0,0`,
+    }))
+    const change = g.latestPrice - g.yesterdayClose
+    const ratioPct = g.yesterdayClose > 0 ? (change / g.yesterdayClose) * 100 : 0
+    return new Quotation({
+      pankouinfos: {
+        indicatorTitle: '盘口',
+        indicatorUrl: '',
+        list: [
+          { ename: 'preClose', name: '昨收', value: g.yesterdayClose.toFixed(2), originValue: String(g.yesterdayClose) },
+        ],
+      },
+      askinfos: [],
+      buyinfos: [],
+      update: {
+        text: '',
+        time: String(Math.floor(Date.now() / 1000)),
+        realUpdateTime: g.delaystr,
+        timezone: 'Asia/Shanghai',
+        shortZone: 'CST',
+        time_diff: 8,
+        stockStatus: '',
+        tradeStatus: 'ENDTR',
+        tradeStatusCN: '',
+      },
+      cur: {
+        time: Math.floor(Date.now() / 1000),
+        price: g.latestPrice.toFixed(2),
+        ratio: `${ratioPct.toFixed(2)}%`,
+        increase: change.toFixed(2),
+        volume: '0',
+        avgPrice: '--',
+        timeKey: '',
+        amount: '--',
+        show: 1,
+        unit: '',
+      },
+      basicinfos: {
+        exchange: 'SGE',
+        code,
+        name: GOLD_INSTRUMENTS[code] ?? instrumentId,
+        stockStatus: '',
+        stock_market_code: '118',
+        stockCode: code,
+        tradeStatus: 'ENDTR',
+        tradeStatusCN: '',
+      },
+      tag_list: [],
+      chartTabs: [],
+      tradingCounters: [],
+      foreign_key: code,
+      releaseDate: '',
+      useWS: '0',
+      financeType: 'stock',
+      newMarketData: {
+        headers: ['时间', '价格', '均价', '成交量', '成交额'],
+        keys: ['date', 'p'],
+        marketData,
+      },
+    })
+  }
+
+  private static async getEmQuotationMinute(code: string): Promise<Quotation> {
     const secid = baiduExchangeToEmSecid(code)
     const mk = Number.parseInt(secid.split('.')[0], 10)
 
@@ -345,9 +739,9 @@ export class EastMoneyStockApi {
 
     const marketData: MarketData[] = []
     let preClose = 0
-    try {
+    const fetchTrends = async (trendsSecid: string) => {
       const minuteData = await cachedGet<string>(
-        `https://push2his.eastmoney.com/api/qt/stock/trends2/get?fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13&fields2=f51,f52,f53,f54,f55,f56,f57,f58&secid=${secid}&klt=1&ndays=1&iscr=0&ut=fa5fd1943c7b386f172d6893dbfba10b`
+        `https://push2his.eastmoney.com/api/qt/stock/trends2/get?fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13&fields2=f51,f52,f53,f54,f55,f56,f57,f58&secid=${trendsSecid}&klt=1&ndays=1&iscr=0&ut=fa5fd1943c7b386f172d6893dbfba10b`
       )
       const m = minuteData as any
       preClose = Number(m?.data?.preKClose ?? 0) / 100 || Number(m?.data?.jqPreClose ?? 0) / 100 || 0
@@ -361,6 +755,14 @@ export class EastMoneyStockApi {
         const amount = parts[6] ?? '0'
         const p = `${date},${price},${avgPrice},${volume},${amount}`
         marketData.push({ date, p })
+      }
+      return trends.length
+    }
+    try {
+      let count = await fetchTrends(secid)
+      // 美股粉单市场（OTC）的 secid 是 153.，默认 105. 查不到分时时补查一次
+      if (count === 0 && secid.startsWith('105.')) {
+        count = await fetchTrends(`153.${code}`)
       }
     } catch {
       /* noop */
@@ -447,6 +849,97 @@ export class EastMoneyStockApi {
     void query
     void month
     return undefined
+  }
+
+  // 东方财富分时接口不可用时，用腾讯分时数据兜底，保证分时图有内容
+  private static async getTencentQuotationMinute(code: string): Promise<Quotation | undefined> {
+    const prefix = tencentPrefixFor(code)
+    if (!prefix) return undefined
+    try {
+      const response = await axios.get(`https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=${prefix}${code}`, { responseType: 'arraybuffer' })
+      const json = JSON.parse(new TextDecoder('utf-8').decode(response.data))
+      const symbol = `${prefix}${code}`
+      const rows: string[] = json?.data?.[symbol]?.data?.data ?? []
+      const qtRow: string[] = json?.data?.[symbol]?.qt?.[symbol] ?? []
+      if (rows.length === 0) return undefined
+      const marketData: { date: string, p: string }[] = []
+      let lastPrice = 0
+      for (const row of rows) {
+        const parts = row.trim().split(/\s+/)
+        if (parts.length < 3) continue
+        const price = Number.parseFloat(parts[1])
+        if (!Number.isFinite(price)) continue
+        lastPrice = price
+        const hhmm = parts[0]
+        const time = `${hhmm.slice(0, 2)}:${hhmm.slice(2)}`
+        marketData.push({ date: time, p: `${time},${parts[1]},,${parts[2] ?? '0'},${parts[3] ?? '0'}` })
+      }
+      if (marketData.length === 0 || lastPrice <= 0) return undefined
+      const parsedPrevClose = Number.parseFloat(qtRow[4])
+      const prevClose = Number.isFinite(parsedPrevClose) && parsedPrevClose > 0 ? parsedPrevClose : lastPrice
+      const increase = lastPrice - prevClose
+      const ratioPct = (increase / prevClose) * 100
+      const ex = prefix.toUpperCase()
+      return new Quotation({
+        pankouinfos: {
+          indicatorTitle: '盘口',
+          indicatorUrl: '',
+          list: [
+            { ename: 'preClose', name: '昨收', value: prevClose.toFixed(2), originValue: String(prevClose) },
+          ],
+        },
+        askinfos: [],
+        buyinfos: [],
+        update: {
+          text: '交易中',
+          time: String(Math.floor(Date.now() / 1000)),
+          realUpdateTime: new Date().toLocaleString('zh-CN', { hour12: false }),
+          timezone: 'Asia/Shanghai',
+          shortZone: 'CST',
+          time_diff: 8,
+          stockStatus: '',
+          tradeStatus: 'ENDTR',
+          tradeStatusCN: '',
+        },
+        cur: {
+          time: Math.floor(Date.now() / 1000),
+          price: lastPrice.toFixed(2),
+          ratio: `${ratioPct.toFixed(2)}%`,
+          increase: increase.toFixed(2),
+          volume: '0',
+          avgPrice: '--',
+          timeKey: '',
+          amount: '--',
+          show: 1,
+          unit: '',
+        },
+        basicinfos: {
+          exchange: ex,
+          code,
+          name: String(qtRow[1] ?? code),
+          stockStatus: '',
+          stock_market_code: ex === 'HK' ? '116' : (ex === 'SH' ? '1' : '0'),
+          stockCode: code,
+          tradeStatus: 'ENDTR',
+          tradeStatusCN: '',
+        },
+        tag_list: [],
+        chartTabs: [],
+        tradingCounters: [],
+        foreign_key: code,
+        releaseDate: '',
+        useWS: '0',
+        financeType: 'stock',
+        newMarketData: {
+          headers: ['时间', '价格', '均价', '成交量', '成交额'],
+          keys: ['date', 'p'],
+          marketData,
+        },
+      })
+    }
+    catch {
+      return undefined
+    }
   }
 }
 

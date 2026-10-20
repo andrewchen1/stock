@@ -1,7 +1,7 @@
 {
   "name": "stock-widget",
   "type": "module",
-  "version": "26.9.3",
+  "version": "26.10.20",
   "private": true,
   "packageManager": "pnpm@9.15.2",
   "scripts": {
@@ -16,13 +16,25 @@
     "release:offline": "widget release -t ftp -f release-offline.json",
     "download:logo": "esno download-coin-logos.ts",
     "build:release": "npm run build && widget release -t ftp",
-    "remote": "widget dependencies -t remote"
+    "remote": "widget dependencies -t remote",
+    "app:start": "electron .",
+    "app:build": "vite build --mode offline && electron-builder --win"
   },
-  "dependencies": {
+  "devDependencies": {
+    "@radix-ui/react-dropdown-menu": "^2.1.24",
     "@supabase/supabase-js": "^2.93.1",
+    "@tailwindcss/vite": "^4.3.3",
     "@tanstack/react-table": "^9.2.4",
+    "@types/color": "^4.2.1",
+    "@types/node": "^18.19.130",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
+    "@types/sortablejs": "^1.15.9",
+    "@vitejs/plugin-react": "^4.7.0",
     "@widget-js/core": "^26.8.20",
     "@widget-js/react": "^26.8.10",
+    "@widget-js/release": "^1.2.0",
+    "@widget-js/vite-plugin-widget": "^26.8.21",
     "axios": "^1.13.3",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
@@ -30,38 +42,30 @@
     "consola": "^3.4.2",
     "echarts": "^5.6.0",
     "echarts-for-react": "^3.0.6",
+    "electron": "^44.9.1",
+    "electron-builder": "^26.15.3",
+    "eslint": "^9.39.2",
+    "esno": "^4.8.0",
+    "lint-staged": "^15.5.2",
     "localforage": "^1.10.0",
     "lucide-react": "^0.454.0",
+    "png-to-ico": "^3.0.2",
+    "postcss": "^8.5.6",
     "radix-ui": "^1.6.7",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "react-router-dom": "^7.1.5",
     "shadcn": "^4.19.1",
+    "sharp": "^0.35.5",
+    "simple-git-hooks": "^2.13.1",
     "sortablejs": "^1.15.6",
     "styled-components": "^6.5.3",
     "tailwind-merge": "^2.6.1",
-    "tw-animate-css": "^1.4.0",
-    "zustand": "^5.0.15"
-  },
-  "devDependencies": {
-    "@radix-ui/react-dropdown-menu": "^2.1.24",
-    "@tailwindcss/vite": "^4.3.3",
-    "@types/color": "^4.2.1",
-    "@types/node": "^18.19.130",
-    "@types/react": "^18.3.31",
-    "@types/react-dom": "^18.3.7",
-    "@types/sortablejs": "^1.15.9",
-    "@vitejs/plugin-react": "^4.7.0",
-    "@widget-js/release": "^1.2.0",
-    "@widget-js/vite-plugin-widget": "^26.8.21",
-    "eslint": "^9.39.2",
-    "esno": "^4.8.0",
-    "lint-staged": "^15.5.2",
-    "postcss": "^8.5.6",
-    "simple-git-hooks": "^2.13.1",
     "tailwindcss": "^4.3.3",
+    "tw-animate-css": "^1.4.0",
     "typescript": "~5.6.3",
-    "vite": "^5.4.21"
+    "vite": "^5.4.21",
+    "zustand": "^5.0.15"
   },
   "simple-git-hooks": {
     "pre-commit": "npx lint-staged"
@@ -70,5 +74,48 @@
     "*.{js,ts,tsx,md}": [
       "eslint --cache --fix"
     ]
+  },
+  "main": "electron/main.cjs",
+  "build": {
+    "appId": "cn.stocks.widget.desktop",
+    "productName": "StockWidget",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "electron/**/*",
+      "dist/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "npmRebuild": false,
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "icon": "public/icon.png",
+      "category": "Utility"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "icon": "public/icon.png"
+    },
+    "nsis": {
+      "artifactName": "StockWidget-Setup-${version}-${arch}.${ext}"
+    }
   }
 }

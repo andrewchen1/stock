@@ -9,6 +9,14 @@ export interface Stock {
   exchange: string
   name: string
   price: string
+  /**
+   * 盘中最高价
+   */
+  high?: string
+  /**
+   * 盘中最低价
+   */
+  low?: string
   increase: string
   ratio: string
   amplitudeRatio: string
@@ -47,4 +55,12 @@ export interface Stock {
    * 持仓数量（股）
    */
   holdingShares?: number
+  /**
+   * 是否由 IPO 扫描自动加入（上市首日结束后自动移除；手动加入的没有该标记）
+   */
+  autoAdded?: boolean
+  /**
+   * 自动移除时间（上市首日结束的时间戳）
+   */
+  autoRemoveAt?: number
 }
