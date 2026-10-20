@@ -20,9 +20,9 @@ jobs:
             args: '--arm64'
           - os: macos-13
             args: '--x64'
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             args: '--x64'
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             args: '--arm64'
     runs-on: ${{ matrix.os }}
     steps:
